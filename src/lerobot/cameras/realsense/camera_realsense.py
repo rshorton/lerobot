@@ -715,7 +715,20 @@ class SharedRealSenseManager:
             except Exception as e:
                 if stop_event.is_set():
                     break
-                if time.monotonic() < self._suppress_read_loop_warnings_until:
+                error_text = str(e)
+                if "frame_ref" in error_text:
+                    logger.debug(
+                        "Suppressing transient RealSense %s frame_ref exception for %s: %s",
+                        self.model_traits.model_name,
+                        self.serial_number,
+                        e,
+                    )
+                    time.sleep(0.05)
+                    continue
+                startup_suppressed = (
+                    time.monotonic() < self._suppress_read_loop_warnings_until or self.last_frames_ts == 0.0
+                )
+                if startup_suppressed:
                     logger.debug(
                         "Suppressing startup RealSense %s read loop exception for %s: %s",
                         self.model_traits.model_name,
@@ -876,7 +889,15 @@ class SharedRealSenseBaseCamera(Camera):
                 time.sleep(0.05)
 
             if not got_frame and warmup_s > 0:
-                if last_error is not None:
+                startup_suppressed = self.manager is not None and (
+                    time.monotonic() < self.manager._suppress_read_loop_warnings_until
+                    or self.manager.last_frames_ts == 0.0
+                )
+                if startup_suppressed and last_error is not None:
+                    logger.debug("Warmup timed out for %s. Last error: %s", self, last_error)
+                elif startup_suppressed:
+                    logger.debug("Warmup timed out for %s.", self)
+                elif last_error is not None:
                     logger.warning("Warmup timed out for %s. Last error: %s", self, last_error)
                 else:
                     logger.warning("Warmup timed out for %s.", self)
