@@ -13,13 +13,30 @@
 # limitations under the License.
 
 """
-Provides the RealSenseCamera class for capturing frames from Intel RealSense cameras.
+Provides the RealSense camera integrations used by LeRobot.
+
+Common RealSense stream profiles seen in practice on this project.
+These are reference comments only. They are not enforced in code.
+
+- D405 color: 640x480@30 rgb8 / bgr8 / yuyv
+- D405 depth: 640x480@30 z16
+- D435i color: 640x480@30 rgb8 / bgr8 / yuyv
+- D435i color: 1280x720@30 rgb8 / bgr8 / yuyv
+- D435i color: 1920x1080@30 rgb8 / bgr8 / yuyv
+- D435i depth: 640x480@30 z16
+
+If a requested stream profile is not supported, the hardware or SDK should reject
+it during `pipeline.start()`. In that case, run `lerobot-find-cameras realsense`
+to inspect the connected model, serial number, USB link, and default profiles.
 """
+
+from __future__ import annotations
 
 import logging
 import time
-from threading import Event, Lock, Thread
-from typing import Any
+from dataclasses import dataclass
+from threading import Condition, Event, Lock, Thread
+from typing import Any, Literal
 
 import cv2  # type: ignore  # TODO: add type stubs for OpenCV
 import numpy as np  # type: ignore  # TODO: add type stubs for numpy
@@ -28,496 +45,927 @@ from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for num
 try:
     import pyrealsense2 as rs  # type: ignore  # TODO: add type stubs for pyrealsense2
 except Exception as e:
+    rs = None
     logging.info(f"Could not import realsense: {e}")
 
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..camera import Camera
 from ..configs import ColorMode
 from ..utils import get_cv2_rotation
-from .configuration_realsense import RealSenseCameraConfig
+from .configuration_realsense import (
+    RealSenseD405ColorCameraConfig,
+    RealSenseD405DepthCameraConfig,
+    RealSenseD435iColorCameraConfig,
+    RealSenseD435iDepthCameraConfig,
+)
 
 logger = logging.getLogger(__name__)
 
+StreamKind = Literal["color", "depth"]
 
-class RealSenseCamera(Camera):
-    """
-    Manages interactions with Intel RealSense cameras for frame and depth recording.
 
-    This class provides an interface similar to `OpenCVCamera` but tailored for
-    RealSense devices, leveraging the `pyrealsense2` library. It uses the camera's
-    unique serial number for identification, offering more stability than device
-    indices, especially on Linux. It also supports capturing depth maps alongside
-    color frames.
+@dataclass(frozen=True)
+class RealSenseModelTraits:
+    key: str
+    model_name: str
+    supported_tokens: tuple[str, ...]
+    supports_max_depth_m: bool = False
 
-    Use the provided utility script to find available camera indices and default profiles:
-    ```bash
-    lerobot-find-cameras realsense
-    ```
 
-    A `RealSenseCamera` instance requires a configuration object specifying the
-    camera's serial number or a unique device name. If using the name, ensure only
-    one camera with that name is connected.
+D405_MODEL_TRAITS = RealSenseModelTraits(
+    key="d405",
+    model_name="D405",
+    supported_tokens=("D405",),
+)
 
-    The camera's default settings (FPS, resolution, color mode) from the stream
-    profile are used unless overridden in the configuration.
+D435I_MODEL_TRAITS = RealSenseModelTraits(
+    key="d435i",
+    model_name="D435i",
+    supported_tokens=("D435I",),
+    supports_max_depth_m=True,
+)
 
-    Example:
-        ```python
-        from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
-        from lerobot.cameras import ColorMode, Cv2Rotation
+REALSENSE_MODEL_REGISTRY: dict[str, RealSenseModelTraits] = {
+    traits.key: traits for traits in (D405_MODEL_TRAITS, D435I_MODEL_TRAITS)
+}
 
-        # Basic usage with serial number
-        config = RealSenseCameraConfig(serial_number_or_name="0123456789") # Replace with actual SN
-        camera = RealSenseCamera(config)
-        camera.connect()
+_SUPPORTED_REALSENSE_TRAITS = tuple(REALSENSE_MODEL_REGISTRY.values())
 
-        # Read 1 frame synchronously (blocking)
-        color_image = camera.read()
 
-        # Read 1 frame asynchronously (waits for new frame with a timeout)
-        async_image = camera.async_read()
+def _require_realsense() -> Any:
+    if rs is None:
+        raise ImportError("pyrealsense2 is required for RealSense cameras.")
+    return rs
 
-        # Get the latest frame immediately (no wait, returns timestamp)
-        latest_image, timestamp = camera.read_latest()
 
-        # Example with depth capture and custom settings
-        custom_config = RealSenseCameraConfig(
-            serial_number_or_name="0123456789", # Replace with actual SN
-            fps=30,
-            width=1280,
-            height=720,
-            color_mode=ColorMode.BGR, # Request BGR output
-            rotation=Cv2Rotation.NO_ROTATION,
-            use_depth=True
+def _get_camera_info(device: Any, field: Any) -> str | None:
+    try:
+        value = device.get_info(field)
+    except Exception:
+        return None
+    return str(value)
+
+
+def _normalize_device_name(name: str) -> str:
+    return name.upper().replace(" ", "")
+
+
+def _detect_model_traits(device_info: dict[str, Any]) -> RealSenseModelTraits | None:
+    normalized_name = _normalize_device_name(device_info["name"])
+    for traits in REALSENSE_MODEL_REGISTRY.values():
+        if any(token in normalized_name for token in traits.supported_tokens):
+            return traits
+    return None
+
+
+def _matches_supported_model(
+    device_info: dict[str, Any], supported_traits: tuple[RealSenseModelTraits, ...] | None
+) -> bool:
+    if supported_traits is None:
+        return True
+    detected_traits = _detect_model_traits(device_info)
+    return detected_traits is not None and any(detected_traits.key == traits.key for traits in supported_traits)
+
+
+def _detect_model_name(device_info: dict[str, str]) -> str:
+    traits = _detect_model_traits(device_info)
+    if traits is not None:
+        return traits.model_name
+    return device_info["name"]
+
+
+def _make_usb_warning(usb_type_descriptor: str | None) -> str | None:
+    if usb_type_descriptor and usb_type_descriptor.startswith("2"):
+        return (
+            f"Detected USB {usb_type_descriptor}. Color/depth streaming may stall. "
+            "A USB 3.x port/cable is strongly recommended."
         )
-        depth_camera = RealSenseCamera(custom_config)
-        depth_camera.connect()
+    return None
 
-        # Read 1 depth frame
-        depth_map = depth_camera.read_depth()
 
-        # Example using a unique camera name
-        name_config = RealSenseCameraConfig(serial_number_or_name="Intel RealSense D435") # If unique
-        name_camera = RealSenseCamera(name_config)
-        # ... connect, read, disconnect ...
-        ```
-    """
+def _extract_default_stream_profile(device: Any) -> dict[str, Any] | None:
+    for sensor in device.query_sensors():
+        try:
+            profiles = sensor.get_stream_profiles()
+        except Exception:
+            continue
 
-    def __init__(self, config: RealSenseCameraConfig):
-        """
-        Initializes the RealSenseCamera instance.
+        for profile in profiles:
+            try:
+                is_default = profile.is_default()
+                is_video = profile.is_video_stream_profile()
+            except Exception:
+                continue
 
-        Args:
-            config: The configuration settings for the camera.
-        """
+            if not is_default or not is_video:
+                continue
 
+            vprofile = profile.as_video_stream_profile()
+            return {
+                "stream_type": vprofile.stream_name(),
+                "format": vprofile.format().name,
+                "width": vprofile.width(),
+                "height": vprofile.height(),
+                "fps": vprofile.fps(),
+            }
+
+    return None
+
+
+def _query_realsense_devices() -> list[dict[str, Any]]:
+    rs_module = _require_realsense()
+    devices_info: list[dict[str, Any]] = []
+    context = rs_module.context()
+    for device in context.query_devices():
+        usb_type_descriptor = _get_camera_info(device, rs_module.camera_info.usb_type_descriptor) or ""
+        device_info: dict[str, Any] = {
+            "name": _get_camera_info(device, rs_module.camera_info.name) or "",
+            "model": "",
+            "serial_number": _get_camera_info(device, rs_module.camera_info.serial_number) or "",
+            "firmware_version": _get_camera_info(device, rs_module.camera_info.firmware_version) or "",
+            "usb_type_descriptor": usb_type_descriptor,
+            "physical_port": _get_camera_info(device, rs_module.camera_info.physical_port) or "",
+            "product_line": _get_camera_info(device, rs_module.camera_info.product_line) or "",
+            "product_id": _get_camera_info(device, rs_module.camera_info.product_id) or "",
+            "default_stream_profile": _extract_default_stream_profile(device),
+            "usb_warning": _make_usb_warning(usb_type_descriptor),
+        }
+        device_info["model"] = _detect_model_name(device_info)
+        devices_info.append(device_info)
+    return devices_info
+
+
+def find_realsense_cameras() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": device["name"],
+            "model": device["model"],
+            "type": "RealSense",
+            "id": device["serial_number"],
+            "serial_number": device["serial_number"],
+            "firmware_version": device["firmware_version"],
+            "usb_type_descriptor": device["usb_type_descriptor"],
+            "usb_warning": device["usb_warning"],
+            "physical_port": device["physical_port"],
+            "product_id": device["product_id"],
+            "product_line": device["product_line"],
+            "default_stream_profile": device["default_stream_profile"],
+        }
+        for device in _query_realsense_devices()
+        if _matches_supported_model(device, _SUPPORTED_REALSENSE_TRAITS)
+    ]
+
+
+def _find_realsense_device_info(
+    serial_number_or_name: str,
+    supported_traits: tuple[RealSenseModelTraits, ...] | None = None,
+) -> dict[str, Any]:
+    devices = _query_realsense_devices()
+    matches = [device for device in devices if device["serial_number"] == serial_number_or_name]
+    if not matches:
+        matches = [device for device in devices if device["name"] == serial_number_or_name]
+
+    if not matches:
+        available = [f'{device["model"]} {device["serial_number"]}' for device in devices]
+        raise ValueError(
+            f"No supported RealSense camera found for '{serial_number_or_name}'. Available devices: {available}"
+        )
+
+    if len(matches) > 1:
+        serials = [device["serial_number"] for device in matches]
+        raise ValueError(
+            f"Multiple RealSense cameras found with name '{serial_number_or_name}'. "
+            f"Please use the serial number instead. Found serials: {serials}"
+        )
+
+    device_info = matches[0]
+    if not _matches_supported_model(device_info, supported_traits):
+        expected = ", ".join(traits.model_name for traits in (supported_traits or ()))
+        raise ValueError(
+            f"Requested RealSense camera '{serial_number_or_name}' resolved to "
+            f"{device_info['model']} ({device_info['serial_number']}), but this camera class "
+            f"only supports: {expected}."
+        )
+
+    return device_info
+
+
+def _resolve_serial_number(
+    serial_number_or_name: str,
+    supported_traits: tuple[RealSenseModelTraits, ...] | None = None,
+) -> tuple[str, str | None]:
+    if serial_number_or_name.isdigit():
+        return serial_number_or_name, None
+
+    device_info = _find_realsense_device_info(serial_number_or_name, supported_traits=supported_traits)
+    return device_info["serial_number"], device_info["name"]
+
+
+def _get_rs_color_format(rs_module: Any, format_name: str | None) -> Any:
+    normalized_format = format_name or "rgb8"
+    try:
+        return getattr(rs_module.format, normalized_format)
+    except AttributeError as e:
+        raise ValueError(f"Unsupported RealSense color stream format '{normalized_format}'.") from e
+
+
+def _decode_color_frame_to_rgb(color_frame: Any) -> NDArray[Any]:
+    rs_module = _require_realsense()
+    color_profile = color_frame.profile.as_video_stream_profile()
+    width = int(color_profile.width())
+    height = int(color_profile.height())
+    frame_format = color_frame.profile.format()
+    color_raw = np.asanyarray(color_frame.get_data())
+
+    if frame_format == rs_module.format.rgb8:
+        return np.ascontiguousarray(color_raw)
+
+    if frame_format == rs_module.format.bgr8:
+        return np.ascontiguousarray(cv2.cvtColor(color_raw, cv2.COLOR_BGR2RGB))
+
+    if frame_format == rs_module.format.yuyv:
+        color_raw = color_raw.view(np.uint8).reshape((height, width, 2))
+        return np.ascontiguousarray(cv2.cvtColor(color_raw, cv2.COLOR_YUV2RGB_YUYV))
+
+    raise RuntimeError(f"Unsupported RealSense color format: {frame_format}")
+
+
+@dataclass(frozen=True)
+class _StreamSpec:
+    enabled: bool
+    width: int | None = None
+    height: int | None = None
+    fps: int | None = None
+    format_name: str | None = None
+
+
+@dataclass(frozen=True)
+class _PipelineSpec:
+    color: _StreamSpec
+    depth: _StreamSpec
+
+    def get(self, kind: StreamKind) -> _StreamSpec:
+        return self.color if kind == "color" else self.depth
+
+    @property
+    def shared_fps(self) -> int | None:
+        fps_values = {
+            stream.fps for stream in (self.color, self.depth) if stream.enabled and stream.fps is not None
+        }
+        if len(fps_values) > 1:
+            return None
+        return next(iter(fps_values), None)
+
+    def satisfies(self, required: "_PipelineSpec") -> bool:
+        return _stream_satisfies(self.color, required.color) and _stream_satisfies(self.depth, required.depth)
+
+
+@dataclass(frozen=True)
+class _ClientRequest:
+    kind: StreamKind
+    fps: int | None
+    width: int | None
+    height: int | None
+    color_stream_format: str | None = None
+    warmup_s: float = 0.0
+
+
+@dataclass(frozen=True)
+class _FrameSnapshot:
+    color: NDArray[Any] | None = None
+    depth: NDArray[Any] | None = None
+
+
+def _stream_satisfies(current: _StreamSpec, required: _StreamSpec) -> bool:
+    if not required.enabled:
+        return True
+    if not current.enabled:
+        return False
+    if required.width is not None and current.width != required.width:
+        return False
+    if required.height is not None and current.height != required.height:
+        return False
+    if required.fps is not None and current.fps != required.fps:
+        return False
+    if required.format_name is not None and current.format_name != required.format_name:
+        return False
+    return True
+
+
+class SharedRealSenseManager:
+    _registry: dict[str, SharedRealSenseManager] = {}
+    _registry_lock = Lock()
+
+    def __init__(
+        self,
+        serial_number: str,
+        model_traits: RealSenseModelTraits,
+        device_name: str | None = None,
+        usb_type_descriptor: str | None = None,
+    ):
+        self.serial_number = serial_number
+        self.model_traits = model_traits
+        self.device_name = device_name
+        self.usb_type_descriptor = usb_type_descriptor
+
+        self._lock = Lock()
+        self._clients: dict[int, _ClientRequest] = {}
+
+        self.pipeline: Any = None
+        self.profile: Any = None
+        self.current_spec: _PipelineSpec | None = None
+        self.depth_scale = 0.001
+
+        self.frame_lock = Lock()
+        self.frame_condition = Condition(self.frame_lock)
+        self.latest_snapshot: _FrameSnapshot | None = None
+        self.frames_seq = 0
+        self.last_frames_ts: float | None = None
+        self._suppress_read_loop_warnings_until: float = 0.0
+
+        self.thread: Thread | None = None
+        self.stop_event = Event()
+
+    @classmethod
+    def get_or_create(
+        cls,
+        serial_number: str,
+        model_traits: RealSenseModelTraits,
+        device_name: str | None = None,
+        usb_type_descriptor: str | None = None,
+    ) -> SharedRealSenseManager:
+        with cls._registry_lock:
+            manager = cls._registry.get(serial_number)
+            if manager is None:
+                manager = cls(
+                    serial_number=serial_number,
+                    model_traits=model_traits,
+                    device_name=device_name,
+                    usb_type_descriptor=usb_type_descriptor,
+                )
+                cls._registry[serial_number] = manager
+            else:
+                if manager.model_traits.key != model_traits.key:
+                    raise RuntimeError(
+                        f"RealSense serial {serial_number} is already registered as "
+                        f"{manager.model_traits.model_name}, but a {model_traits.model_name} camera was requested."
+                    )
+                manager.update_device_info(device_name=device_name, usb_type_descriptor=usb_type_descriptor)
+            return manager
+
+    @classmethod
+    def drop_if_unused(cls, serial_number: str, manager: SharedRealSenseManager) -> None:
+        with cls._registry_lock:
+            if not manager.has_clients():
+                current = cls._registry.get(serial_number)
+                if current is manager:
+                    cls._registry.pop(serial_number, None)
+
+    def has_clients(self) -> bool:
+        with self._lock:
+            return bool(self._clients)
+
+    def update_device_info(self, device_name: str | None, usb_type_descriptor: str | None) -> None:
+        with self._lock:
+            if device_name:
+                self.device_name = device_name
+            if usb_type_descriptor:
+                self.usb_type_descriptor = usb_type_descriptor
+
+    def connect_client(self, client_id: int, request: _ClientRequest) -> _PipelineSpec:
+        with self._lock:
+            if client_id in self._clients:
+                if self.current_spec is None:
+                    raise RuntimeError(f"Manager for {self.serial_number} lost its active pipeline state.")
+                return self.current_spec
+
+            desired_spec = self._build_desired_spec(extra_request=request)
+            if self.current_spec is None or not self.current_spec.satisfies(desired_spec):
+                self._restart_pipeline_locked(desired_spec)
+
+            self._clients[client_id] = request
+            self._extend_startup_warning_suppression(request.warmup_s)
+            if self.current_spec is None:
+                raise RuntimeError(f"Manager for {self.serial_number} failed to start a pipeline.")
+            return self.current_spec
+
+    def disconnect_client(self, client_id: int) -> None:
+        should_drop = False
+        with self._lock:
+            self._clients.pop(client_id, None)
+            if self._clients:
+                return
+            self._stop_pipeline_locked()
+            should_drop = True
+
+        if should_drop:
+            self.drop_if_unused(self.serial_number, self)
+
+    def get_latest_snapshot(self) -> _FrameSnapshot | None:
+        with self.frame_lock:
+            return self.latest_snapshot
+
+    def get_latest_frames_and_seq(self) -> tuple[_FrameSnapshot | None, int]:
+        with self.frame_lock:
+            return self.latest_snapshot, self.frames_seq
+
+    def wait_for_next_snapshot(self, last_seq: int, timeout_s: float) -> tuple[_FrameSnapshot | None, int]:
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        with self.frame_condition:
+            while True:
+                if self.latest_snapshot is not None and self.frames_seq != last_seq:
+                    return self.latest_snapshot, self.frames_seq
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, last_seq
+
+                self.frame_condition.wait(timeout=remaining)
+
+    def _extend_startup_warning_suppression(self, warmup_s: float) -> None:
+        if warmup_s <= 0:
+            return
+        self._suppress_read_loop_warnings_until = max(
+            self._suppress_read_loop_warnings_until,
+            time.monotonic() + warmup_s + 0.5,
+        )
+
+    def get_output_stream_spec(self, kind: StreamKind) -> _StreamSpec:
+        with self._lock:
+            current_spec = self.current_spec
+
+        if current_spec is None:
+            raise RuntimeError(f"Manager for {self.serial_number} does not have an active pipeline.")
+
+        return current_spec.get(kind)
+
+    def get_status(self) -> dict[str, Any]:
+        with self.frame_lock:
+            last_frames_ts = self.last_frames_ts
+            frames_seq = self.frames_seq
+
+        with self._lock:
+            current_spec = self.current_spec
+            client_count = len(self._clients)
+            device_name = self.device_name
+            usb_type_descriptor = self.usb_type_descriptor
+
+        return {
+            "serial_number": self.serial_number,
+            "device_name": device_name,
+            "model": self.model_traits.model_name,
+            "usb_type_descriptor": usb_type_descriptor,
+            "has_pipeline": self.pipeline is not None,
+            "clients": client_count,
+            "frames_seq": frames_seq,
+            "last_frames_age_s": None if last_frames_ts is None else (time.time() - last_frames_ts),
+            "thread_alive": self.thread is not None and self.thread.is_alive(),
+            "current_spec": current_spec,
+        }
+
+    def _build_desired_spec(self, extra_request: _ClientRequest | None = None) -> _PipelineSpec:
+        requests = list(self._clients.values())
+        if extra_request is not None:
+            requests.append(extra_request)
+
+        explicit_fps = {request.fps for request in requests if request.fps is not None}
+        if len(explicit_fps) > 1:
+            raise ValueError(
+                f"RealSense {self.model_traits.model_name} cameras sharing serial {self.serial_number} "
+                "must use the same fps. "
+                f"Requested fps values: {sorted(explicit_fps)}"
+            )
+
+        sticky_fps = self.current_spec.shared_fps if self.current_spec is not None else None
+        fps = next(iter(explicit_fps), sticky_fps)
+
+        color_enabled = any(request.kind == "color" for request in requests)
+        depth_enabled = any(request.kind == "depth" for request in requests)
+        if self.current_spec is not None:
+            color_enabled = color_enabled or self.current_spec.color.enabled
+            depth_enabled = depth_enabled or self.current_spec.depth.enabled
+
+        color_spec = self._build_stream_spec(kind="color", enabled=color_enabled, requests=requests, fps=fps)
+        depth_spec = self._build_stream_spec(kind="depth", enabled=depth_enabled, requests=requests, fps=fps)
+        return _PipelineSpec(color=color_spec, depth=depth_spec)
+
+    def _build_stream_spec(
+        self, kind: StreamKind, enabled: bool, requests: list[_ClientRequest], fps: int | None
+    ) -> _StreamSpec:
+        if not enabled:
+            return _StreamSpec(enabled=False)
+
+        current_stream = self.current_spec.get(kind) if self.current_spec is not None else _StreamSpec(False)
+
+        widths = {request.width for request in requests if request.kind == kind and request.width is not None}
+        heights = {request.height for request in requests if request.kind == kind and request.height is not None}
+        if len(widths) > 1 or len(heights) > 1:
+            raise ValueError(
+                f"RealSense {self.model_traits.model_name} {kind} cameras sharing serial {self.serial_number} "
+                "must use the same resolution."
+            )
+
+        width = next(iter(widths), current_stream.width if current_stream.enabled else None)
+        height = next(iter(heights), current_stream.height if current_stream.enabled else None)
+        format_name = None
+        if kind == "color":
+            formats = {
+                request.color_stream_format
+                for request in requests
+                if request.kind == "color" and request.color_stream_format is not None
+            }
+            if len(formats) > 1:
+                raise ValueError(
+                    f"RealSense {self.model_traits.model_name} color cameras sharing serial {self.serial_number} "
+                    "must use the same color stream format."
+                )
+            format_name = next(iter(formats), current_stream.format_name if current_stream.enabled else "rgb8")
+
+        return _StreamSpec(enabled=True, width=width, height=height, fps=fps, format_name=format_name)
+
+    def _restart_pipeline_locked(self, desired_spec: _PipelineSpec) -> None:
+        self._stop_pipeline_locked()
+        self._start_pipeline_locked(desired_spec)
+
+    def _start_pipeline_locked(self, desired_spec: _PipelineSpec) -> None:
+        rs_module = _require_realsense()
+        pipeline = rs_module.pipeline()
+        rs_config = self._create_rs_config(desired_spec)
+
+        try:
+            profile = pipeline.start(rs_config)
+        except Exception as e:
+            message = str(e)
+            if "resource busy" in message.lower():
+                raise RuntimeError(
+                    f"{self.model_traits.model_name} is busy. Close other processes that may be using the camera "
+                    "(for example another viewer, RealSense Viewer, ffmpeg, or a previous script)."
+                ) from e
+            raise ConnectionError(
+                f"Failed to open RealSense {self.model_traits.model_name} camera {self.serial_number} "
+                "with requested streams "
+                f"{desired_spec}. The device or SDK rejected this profile. Run `lerobot-find-cameras realsense` "
+                "to inspect the connected model, serial number, USB link, and default stream profile."
+            ) from e
+
+        actual_spec = self._extract_actual_spec(profile, desired_spec)
+
+        self.pipeline = pipeline
+        self.profile = profile
+        self.current_spec = actual_spec
+        self.depth_scale = self._extract_depth_scale(profile)
+
+        with self.frame_condition:
+            self.latest_snapshot = None
+            self.frames_seq = 0
+            self.last_frames_ts = None
+            self.frame_condition.notify_all()
+
+        usb_warning = _make_usb_warning(self.usb_type_descriptor)
+        if usb_warning:
+            logger.warning("RealSense %s (%s): %s", self.model_traits.model_name, self.serial_number, usb_warning)
+
+        self.stop_event = Event()
+        self.thread = Thread(
+            target=self._read_loop,
+            name=f"RealSense{self.model_traits.model_name}Manager[{self.serial_number}]_read_loop",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def _create_rs_config(self, desired_spec: _PipelineSpec) -> Any:
+        rs_module = _require_realsense()
+        rs_config = rs_module.config()
+        rs_config.enable_device(self.serial_number)
+        self._enable_stream(rs_config, kind="depth", spec=desired_spec.depth)
+        self._enable_stream(rs_config, kind="color", spec=desired_spec.color)
+        return rs_config
+
+    def _enable_stream(self, rs_config: Any, kind: StreamKind, spec: _StreamSpec) -> None:
+        if not spec.enabled:
+            return
+
+        rs_module = _require_realsense()
+        stream = rs_module.stream.color if kind == "color" else rs_module.stream.depth
+        fmt = _get_rs_color_format(rs_module, spec.format_name) if kind == "color" else rs_module.format.z16
+        fps = spec.fps if spec.fps is not None else 0
+
+        if spec.width is None or spec.height is None:
+            rs_config.enable_stream(stream, 0, 0, fmt, fps)
+            return
+
+        rs_config.enable_stream(stream, spec.width, spec.height, fmt, fps)
+
+    def _extract_actual_spec(self, profile: Any, desired_spec: _PipelineSpec) -> _PipelineSpec:
+        rs_module = _require_realsense()
+        color_spec = _StreamSpec(enabled=False)
+        depth_spec = _StreamSpec(enabled=False)
+
+        if desired_spec.color.enabled:
+            color_profile = profile.get_stream(rs_module.stream.color).as_video_stream_profile()
+            color_spec = _StreamSpec(
+                enabled=True,
+                width=int(color_profile.width()),
+                height=int(color_profile.height()),
+                fps=int(color_profile.fps()),
+                format_name=desired_spec.color.format_name,
+            )
+
+        if desired_spec.depth.enabled:
+            depth_profile = profile.get_stream(rs_module.stream.depth).as_video_stream_profile()
+            depth_spec = _StreamSpec(
+                enabled=True,
+                width=int(depth_profile.width()),
+                height=int(depth_profile.height()),
+                fps=int(depth_profile.fps()),
+            )
+
+        return _PipelineSpec(color=color_spec, depth=depth_spec)
+
+    def _extract_depth_scale(self, profile: Any) -> float:
+        try:
+            device = profile.get_device()
+            for sensor in device.query_sensors():
+                if hasattr(sensor, "get_depth_scale"):
+                    return float(sensor.get_depth_scale())
+        except Exception:
+            pass
+        return 0.001
+
+    def _read_loop(self) -> None:
+        pipeline = self.pipeline
+        stop_event = self.stop_event
+        if pipeline is None or stop_event is None:
+            return
+
+        while not stop_event.is_set():
+            try:
+                ret, frames = pipeline.try_wait_for_frames(timeout_ms=100)
+                if not ret or frames is None:
+                    continue
+
+                snapshot = self._build_frame_snapshot(frames)
+                with self.frame_condition:
+                    self.latest_snapshot = snapshot
+                    self.frames_seq += 1
+                    self.last_frames_ts = time.time()
+                    self.frame_condition.notify_all()
+
+            except Exception as e:
+                if stop_event.is_set():
+                    break
+                if time.monotonic() < self._suppress_read_loop_warnings_until:
+                    logger.debug(
+                        "Suppressing startup RealSense %s read loop exception for %s: %s",
+                        self.model_traits.model_name,
+                        self.serial_number,
+                        e,
+                    )
+                else:
+                    logger.warning(
+                        "RealSense %s read loop exception for %s: %s",
+                        self.model_traits.model_name,
+                        self.serial_number,
+                        e,
+                    )
+                time.sleep(0.05)
+
+    def _build_frame_snapshot(self, frames: Any) -> _FrameSnapshot:
+        color = None
+        depth = None
+
+        color_frame = frames.get_color_frame()
+        if color_frame is not None:
+            color = np.ascontiguousarray(_decode_color_frame_to_rgb(color_frame))
+
+        depth_frame = frames.get_depth_frame()
+        if depth_frame is not None:
+            depth = np.ascontiguousarray(np.asanyarray(depth_frame.get_data()).copy())
+
+        return _FrameSnapshot(color=color, depth=depth)
+
+    def _stop_pipeline_locked(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception as e:
+                logger.warning(
+                    "Error stopping RealSense %s pipeline for %s: %s",
+                    self.model_traits.model_name,
+                    self.serial_number,
+                    e,
+                )
+
+        self.thread = None
+        self.stop_event = Event()
+        self.pipeline = None
+        self.profile = None
+        self.current_spec = None
+        self.depth_scale = 0.001
+
+        with self.frame_condition:
+            self.latest_snapshot = None
+            self.frames_seq = 0
+            self.last_frames_ts = None
+            self.frame_condition.notify_all()
+
+class SharedRealSenseBaseCamera(Camera):
+    KIND: StreamKind
+    MODEL_TRAITS: RealSenseModelTraits
+
+    def __init__(
+        self,
+        config: (
+            RealSenseD405ColorCameraConfig
+            | RealSenseD405DepthCameraConfig
+            | RealSenseD435iColorCameraConfig
+            | RealSenseD435iDepthCameraConfig
+        ),
+    ):
         super().__init__(config)
-
         self.config = config
-
-        if config.serial_number_or_name.isdigit():
-            self.serial_number = config.serial_number_or_name
-        else:
-            self.serial_number = self._find_serial_number_from_name(config.serial_number_or_name)
-
-        self.fps = config.fps
-        self.color_mode = config.color_mode
-        self.use_depth = config.use_depth
-        self.warmup_s = config.warmup_s
-
-        self.rs_pipeline: rs.pipeline | None = None
-        self.rs_profile: rs.pipeline_profile | None = None
+        self.serial_number, self.device_name = _resolve_serial_number(
+            config.serial_number_or_name, supported_traits=(self.MODEL_TRAITS,)
+        )
+        self.manager: SharedRealSenseManager | None = None
+        self.connected = False
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
-        self.frame_lock: Lock = Lock()
-        self.latest_color_frame: NDArray[Any] | None = None
-        self.latest_depth_frame: NDArray[Any] | None = None
-        self.latest_timestamp: float | None = None
-        self.new_frame_event: Event = Event()
+        self.frame_lock = Lock()
+        self.latest_frame: NDArray[Any] | None = None
+        self.new_frame_event = Event()
+        self._last_frame_ts: float | None = None
+        self._last_pipeline_seq = -1
 
-        self.rotation: int | None = get_cv2_rotation(config.rotation)
-
-        if self.height and self.width:
-            self.capture_width, self.capture_height = self.width, self.height
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-                self.capture_width, self.capture_height = self.height, self.width
+        self.rotation = get_cv2_rotation(config.rotation)
+        self.capture_width = self.width
+        self.capture_height = self.height
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.serial_number})"
 
     @property
     def is_connected(self) -> bool:
-        """Checks if the camera pipeline is started and streams are active."""
-        return self.rs_pipeline is not None and self.rs_profile is not None
+        return self.connected
+
+    @classmethod
+    def find_cameras(cls) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": device["name"],
+                "model": device["model"],
+                "type": "RealSense",
+                "id": device["serial_number"],
+                "serial_number": device["serial_number"],
+                "firmware_version": device["firmware_version"],
+                "usb_type_descriptor": device["usb_type_descriptor"],
+                "usb_warning": device["usb_warning"],
+                "product_line": device["product_line"],
+                "product_id": device["product_id"],
+                "default_stream_profile": device["default_stream_profile"],
+            }
+            for device in _query_realsense_devices()
+            if _matches_supported_model(device, (cls.MODEL_TRAITS,))
+        ]
 
     def connect(self, warmup: bool = True) -> None:
-        """
-        Connects to the RealSense camera specified in the configuration.
+        if self.connected:
+            return
 
-        Initializes the RealSense pipeline, configures the required streams (color
-        and optionally depth), starts the pipeline, and validates the actual stream settings.
-
-        Args:
-            warmup (bool): If True, waits at connect() time until at least one valid frame
-                           has been captured by the background thread. Defaults to True.
-
-        Raises:
-            DeviceAlreadyConnectedError: If the camera is already connected.
-            ValueError: If the configuration is invalid (e.g., missing serial/name, name not unique).
-            ConnectionError: If the camera is found but fails to start the pipeline or no RealSense devices are detected at all.
-            RuntimeError: If the pipeline starts but fails to apply requested settings.
-        """
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} is already connected.")
-
-        self.rs_pipeline = rs.pipeline()
-        rs_config = rs.config()
-        self._configure_rs_pipeline_config(rs_config)
+        device_info = _find_realsense_device_info(self.serial_number, supported_traits=(self.MODEL_TRAITS,))
+        self.device_name = device_info["name"]
+        self.manager = SharedRealSenseManager.get_or_create(
+            self.serial_number,
+            model_traits=self.MODEL_TRAITS,
+            device_name=self.device_name,
+            usb_type_descriptor=device_info["usb_type_descriptor"],
+        )
 
         try:
-            self.rs_profile = self.rs_pipeline.start(rs_config)
-        except RuntimeError as e:
-            self.rs_profile = None
-            self.rs_pipeline = None
-            raise ConnectionError(
-                f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
-            ) from e
+            spec = self.manager.connect_client(client_id=id(self), request=self._build_client_request())
+            self._apply_stream_settings(spec.get(self.KIND))
+        except Exception:
+            if self.manager is not None:
+                SharedRealSenseManager.drop_if_unused(self.serial_number, self.manager)
+            self.manager = None
+            raise
 
-        self._configure_capture_settings()
-        self._start_read_thread()
+        self.connected = True
 
-        # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
-        self.warmup_s = max(self.warmup_s, 1)
+        if warmup:
+            warmup_s = float(getattr(self.config, "warmup_s", 0) or 0)
+            deadline = time.time() + warmup_s
+            got_frame = False
+            last_error: Exception | None = None
+            while time.time() < deadline:
+                try:
+                    frame = self.read()
+                    if frame is not None:
+                        got_frame = True
+                        break
+                except Exception as e:
+                    last_error = e
+                time.sleep(0.05)
 
-        start_time = time.time()
-        while time.time() - start_time < self.warmup_s:
-            self.async_read(timeout_ms=self.warmup_s * 1000)
-            time.sleep(0.1)
-        with self.frame_lock:
-            if self.latest_color_frame is None or self.use_depth and self.latest_depth_frame is None:
-                raise ConnectionError(f"{self} failed to capture frames during warmup.")
+            if not got_frame and warmup_s > 0:
+                if last_error is not None:
+                    logger.warning("Warmup timed out for %s. Last error: %s", self, last_error)
+                else:
+                    logger.warning("Warmup timed out for %s.", self)
 
-        logger.info(f"{self} connected.")
+    def _build_client_request(self) -> _ClientRequest:
+        color_stream_format = getattr(self.config, "color_stream_format", None) if self.KIND == "color" else None
+        return _ClientRequest(
+            kind=self.KIND,
+            fps=self.config.fps,
+            width=self.config.width,
+            height=self.config.height,
+            color_stream_format=color_stream_format,
+            warmup_s=float(getattr(self.config, "warmup_s", 0) or 0),
+        )
 
-    @staticmethod
-    def find_cameras() -> list[dict[str, Any]]:
-        """
-        Detects available Intel RealSense cameras connected to the system.
+    def _apply_stream_settings(self, stream_spec: _StreamSpec) -> None:
+        if not stream_spec.enabled or stream_spec.width is None or stream_spec.height is None:
+            raise RuntimeError(f"{self} failed to resolve active stream settings for {self.KIND}.")
 
-        Returns:
-            List[Dict[str, Any]]: A list of dictionaries,
-            where each dictionary contains 'type', 'id' (serial number), 'name',
-            firmware version, USB type, and other available specs, and the default profile properties (width, height, fps, format).
+        self.fps = stream_spec.fps
+        self.capture_width = stream_spec.width
+        self.capture_height = stream_spec.height
 
-        Raises:
-            OSError: If pyrealsense2 is not installed.
-            ImportError: If pyrealsense2 is not installed.
-        """
-        found_cameras_info = []
-        context = rs.context()
-        devices = context.query_devices()
-
-        for device in devices:
-            camera_info = {
-                "name": device.get_info(rs.camera_info.name),
-                "type": "RealSense",
-                "id": device.get_info(rs.camera_info.serial_number),
-                "firmware_version": device.get_info(rs.camera_info.firmware_version),
-                "usb_type_descriptor": device.get_info(rs.camera_info.usb_type_descriptor),
-                "physical_port": device.get_info(rs.camera_info.physical_port),
-                "product_id": device.get_info(rs.camera_info.product_id),
-                "product_line": device.get_info(rs.camera_info.product_line),
-            }
-
-            # Get stream profiles for each sensor
-            sensors = device.query_sensors()
-            for sensor in sensors:
-                profiles = sensor.get_stream_profiles()
-
-                for profile in profiles:
-                    if profile.is_video_stream_profile() and profile.is_default():
-                        vprofile = profile.as_video_stream_profile()
-                        stream_info = {
-                            "stream_type": vprofile.stream_name(),
-                            "format": vprofile.format().name,
-                            "width": vprofile.width(),
-                            "height": vprofile.height(),
-                            "fps": vprofile.fps(),
-                        }
-                        camera_info["default_stream_profile"] = stream_info
-
-            found_cameras_info.append(camera_info)
-
-        return found_cameras_info
-
-    def _find_serial_number_from_name(self, name: str) -> str:
-        """Finds the serial number for a given unique camera name."""
-        camera_infos = self.find_cameras()
-        found_devices = [cam for cam in camera_infos if str(cam["name"]) == name]
-
-        if not found_devices:
-            available_names = [cam["name"] for cam in camera_infos]
-            raise ValueError(
-                f"No RealSense camera found with name '{name}'. Available camera names: {available_names}"
-            )
-
-        if len(found_devices) > 1:
-            serial_numbers = [dev["serial_number"] for dev in found_devices]
-            raise ValueError(
-                f"Multiple RealSense cameras found with name '{name}'. "
-                f"Please use a unique serial number instead. Found SNs: {serial_numbers}"
-            )
-
-        serial_number = str(found_devices[0]["serial_number"])
-        return serial_number
-
-    def _configure_rs_pipeline_config(self, rs_config: Any) -> None:
-        """Creates and configures the RealSense pipeline configuration object."""
-        rs.config.enable_device(rs_config, self.serial_number)
-
-        if self.width and self.height and self.fps:
-            rs_config.enable_stream(
-                rs.stream.color, self.capture_width, self.capture_height, rs.format.rgb8, self.fps
-            )
-            if self.use_depth:
-                rs_config.enable_stream(
-                    rs.stream.depth, self.capture_width, self.capture_height, rs.format.z16, self.fps
-                )
+        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
+            self.width = stream_spec.height
+            self.height = stream_spec.width
         else:
-            rs_config.enable_stream(rs.stream.color)
-            if self.use_depth:
-                rs_config.enable_stream(rs.stream.depth)
+            self.width = stream_spec.width
+            self.height = stream_spec.height
 
-    def _configure_capture_settings(self) -> None:
-        """Sets fps, width, and height from device stream if not already configured.
+    def _sync_stream_settings(self) -> None:
+        if not self.connected or self.manager is None:
+            return
 
-        Uses the color stream profile to update unset attributes. Handles rotation by
-        swapping width/height when needed. Original capture dimensions are always stored.
-
-        Raises:
-            DeviceNotConnectedError: If device is not connected.
-        """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"Cannot validate settings for {self} as it is not connected.")
-
-        if self.rs_profile is None:
-            raise RuntimeError(f"{self}: rs_profile must be initialized before use.")
-
-        stream = self.rs_profile.get_stream(rs.stream.color).as_video_stream_profile()
-
-        if self.fps is None:
-            self.fps = stream.fps()
-
-        if self.width is None or self.height is None:
-            actual_width = int(round(stream.width()))
-            actual_height = int(round(stream.height()))
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-                self.width, self.height = actual_height, actual_width
-                self.capture_width, self.capture_height = actual_width, actual_height
-            else:
-                self.width, self.height = actual_width, actual_height
-                self.capture_width, self.capture_height = actual_width, actual_height
-
-    def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:
-        """
-        Reads a single frame (depth) synchronously from the camera.
-
-        This is a blocking call. It waits for a coherent set of frames (depth)
-        from the camera hardware via the RealSense pipeline.
-
-        Returns:
-            np.ndarray: The depth map as a NumPy array (height, width)
-                  of type `np.uint16` (raw depth values in millimeters) and rotation.
-
-        Raises:
-            DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If reading frames from the pipeline fails or frames are invalid.
-        """
-        if timeout_ms:
-            logger.warning(
-                f"{self} read() timeout_ms parameter is deprecated and will be removed in future versions."
+        stream_spec = self.manager.get_output_stream_spec(self.KIND)
+        if (
+            stream_spec.enabled
+            and (
+                stream_spec.width != self.capture_width
+                or stream_spec.height != self.capture_height
+                or stream_spec.fps != self.fps
             )
+        ):
+            self._apply_stream_settings(stream_spec)
 
-        if not self.use_depth:
-            raise RuntimeError(
-                f"Failed to capture depth frame '.read_depth()'. Depth stream is not enabled for {self}."
-            )
+    def _read_from_snapshot(self, snapshot: _FrameSnapshot, color_mode: ColorMode | None = None) -> NDArray[Any] | None:
+        raise NotImplementedError
 
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
-
-        self.new_frame_event.clear()
-
-        _ = self.async_read(timeout_ms=10000)
+    def _process_snapshot(self, snapshot: _FrameSnapshot) -> NDArray[Any] | None:
+        frame = self._read_from_snapshot(snapshot)
+        if frame is None:
+            return None
 
         with self.frame_lock:
-            depth_map = self.latest_depth_frame
-
-        if depth_map is None:
-            raise RuntimeError("No depth frame available. Ensure camera is streaming.")
-
-        return depth_map
-
-    def _read_from_hardware(self):
-        if self.rs_pipeline is None:
-            raise RuntimeError(f"{self}: rs_pipeline must be initialized before use.")
-
-        ret, frame = self.rs_pipeline.try_wait_for_frames(timeout_ms=10000)
-
-        if not ret or frame is None:
-            raise RuntimeError(f"{self} read failed (status={ret}).")
-
+            self.latest_frame = frame
+        self._last_frame_ts = time.time()
         return frame
-
-    def read(self, color_mode: ColorMode | None = None, timeout_ms: int = 0) -> NDArray[Any]:
-        """
-        Reads a single frame (color) synchronously from the camera.
-
-        This is a blocking call. It waits for a coherent set of frames (color)
-        from the camera hardware via the RealSense pipeline.
-
-        Returns:
-            np.ndarray: The captured color frame as a NumPy array
-              (height, width, channels), processed according to `color_mode` and rotation.
-
-        Raises:
-            DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If reading frames from the pipeline fails or frames are invalid.
-            ValueError: If an invalid `color_mode` is requested.
-        """
-
-        start_time = time.perf_counter()
-
-        if color_mode is not None:
-            logger.warning(
-                f"{self} read() color_mode parameter is deprecated and will be removed in future versions."
-            )
-
-        if timeout_ms:
-            logger.warning(
-                f"{self} read() timeout_ms parameter is deprecated and will be removed in future versions."
-            )
-
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
-
-        self.new_frame_event.clear()
-
-        frame = self.async_read(timeout_ms=10000)
-
-        read_duration_ms = (time.perf_counter() - start_time) * 1e3
-        logger.debug(f"{self} read took: {read_duration_ms:.1f}ms")
-
-        return frame
-
-    def _postprocess_image(self, image: NDArray[Any], depth_frame: bool = False) -> NDArray[Any]:
-        """
-        Applies color conversion, dimension validation, and rotation to a raw color frame.
-
-        Args:
-            image (np.ndarray): The raw image frame (expected RGB format from RealSense).
-
-        Returns:
-            np.ndarray: The processed image frame according to `self.color_mode` and `self.rotation`.
-
-        Raises:
-            ValueError: If the requested `color_mode` is invalid.
-            RuntimeError: If the raw frame dimensions do not match the configured
-                          `width` and `height`.
-        """
-
-        if self.color_mode and self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
-            raise ValueError(
-                f"Invalid requested color mode '{self.color_mode}'. Expected {ColorMode.RGB} or {ColorMode.BGR}."
-            )
-
-        if depth_frame:
-            h, w = image.shape
-        else:
-            h, w, c = image.shape
-
-            if c != 3:
-                raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
-
-        if h != self.capture_height or w != self.capture_width:
-            raise RuntimeError(
-                f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
-            )
-
-        processed_image = image
-        if self.color_mode == ColorMode.BGR:
-            processed_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
-            processed_image = cv2.rotate(processed_image, self.rotation)
-
-        return processed_image
 
     def _read_loop(self) -> None:
-        """
-        Internal loop run by the background thread for asynchronous reading.
+        if self.manager is None:
+            raise RuntimeError(f"{self}: manager must be initialized before starting the read loop.")
 
-        On each iteration:
-        1. Reads a color frame with 500ms timeout
-        2. Stores result in latest_frame and updates timestamp (thread-safe)
-        3. Sets new_frame_event to notify listeners
-
-        Stops on DeviceNotConnectedError, logs other errors and continues.
-        """
-        if self.stop_event is None:
-            raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
-
-        failure_count = 0
-        while not self.stop_event.is_set():
+        while not (self.stop_event and self.stop_event.is_set()):
             try:
-                frame = self._read_from_hardware()
-                color_frame_raw = frame.get_color_frame()
-                color_frame = np.asanyarray(color_frame_raw.get_data())
-                processed_color_frame = self._postprocess_image(color_frame)
+                snapshot, seq = self.manager.wait_for_next_snapshot(self._last_pipeline_seq, timeout_s=0.5)
+                if snapshot is None or seq == self._last_pipeline_seq:
+                    continue
 
-                if self.use_depth:
-                    depth_frame_raw = frame.get_depth_frame()
-                    depth_frame = np.asanyarray(depth_frame_raw.get_data())
-                    processed_depth_frame = self._postprocess_image(depth_frame, depth_frame=True)
+                self._last_pipeline_seq = seq
+                frame = self._process_snapshot(snapshot)
+                if frame is None:
+                    continue
 
-                capture_time = time.perf_counter()
-
-                with self.frame_lock:
-                    self.latest_color_frame = processed_color_frame
-                    if self.use_depth:
-                        self.latest_depth_frame = processed_depth_frame
-                    self.latest_timestamp = capture_time
                 self.new_frame_event.set()
-                failure_count = 0
-
             except DeviceNotConnectedError:
                 break
             except Exception as e:
-                if failure_count <= 10:
-                    failure_count += 1
-                    logger.warning(f"Error reading frame in background thread for {self}: {e}")
-                else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+                logger.warning("Error reading frame in background thread for %s: %s", self, e)
+                time.sleep(0.05)
 
     def _start_read_thread(self) -> None:
-        """Starts or restarts the background read thread if it's not running."""
-        self._stop_read_thread()
+        if self.thread is not None and self.thread.is_alive():
+            return
 
         self.stop_event = Event()
-        self.thread = Thread(target=self._read_loop, args=(), name=f"{self}_read_loop")
-        self.thread.daemon = True
+        self.thread = Thread(target=self._read_loop, name=f"{self.__class__.__name__}_read_loop", daemon=True)
         self.thread.start()
 
     def _stop_read_thread(self) -> None:
-        """Signals the background read thread to stop and waits for it to join."""
         if self.stop_event is not None:
             self.stop_event.set()
 
@@ -527,120 +975,176 @@ class RealSenseCamera(Camera):
         self.thread = None
         self.stop_event = None
 
-        with self.frame_lock:
-            self.latest_color_frame = None
-            self.latest_depth_frame = None
-            self.latest_timestamp = None
-            self.new_frame_event.clear()
-
-    # NOTE(Steven): Missing implementation for depth for now
-    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
-        """
-        Reads the latest available frame data (color) asynchronously.
-
-        This method retrieves the most recent color frame captured by the background
-        read thread. It does not block waiting for the camera hardware directly,
-        but may wait up to timeout_ms for the background thread to provide a frame.
-        It is “best effort” under high FPS.
-
-        Args:
-            timeout_ms (float): Maximum time in milliseconds to wait for a frame
-                to become available. Defaults to 200ms (0.2 seconds).
-
-        Returns:
-            np.ndarray:
-            The latest captured frame data (color image), processed according to configuration.
-
-        Raises:
-            DeviceNotConnectedError: If the camera is not connected.
-            TimeoutError: If no frame data becomes available within the specified timeout.
-            RuntimeError: If the background thread died unexpectedly or another error occurs.
-        """
-        if not self.is_connected:
+    def async_read(self, timeout_ms: float = 5000) -> NDArray[Any]:
+        if not self.connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        if self.manager is None:
+            raise RuntimeError(f"{self} does not have an active RealSense manager.")
+
         if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
+            self._start_read_thread()
 
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+            manager_status = self.manager.get_status()
             raise TimeoutError(
-                f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
-                f"Read thread alive: {self.thread.is_alive()}."
+                f"Timed out waiting for frame from camera {self}. "
+                f"Manager status: {manager_status}"
             )
 
         with self.frame_lock:
-            frame = self.latest_color_frame
+            frame = self.latest_frame
             self.new_frame_event.clear()
 
         if frame is None:
-            raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
-
-        return frame
-
-    # NOTE(Steven): Missing implementation for depth for now
-    def read_latest(self, max_age_ms: int = 1000) -> NDArray[Any]:
-        """Return the most recent (color) frame captured immediately (Peeking).
-
-        This method is non-blocking and returns whatever is currently in the
-        memory buffer. The frame may be stale,
-        meaning it could have been captured a while ago (hanging camera scenario e.g.).
-
-        Returns:
-            NDArray[Any]: The frame image (numpy array).
-
-        Raises:
-            TimeoutError: If the latest frame is older than `max_age_ms`.
-            DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If the camera is connected but has not captured any frames yet.
-        """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
-        if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
-
-        with self.frame_lock:
-            frame = self.latest_color_frame
-            timestamp = self.latest_timestamp
-
-        if frame is None or timestamp is None:
-            raise RuntimeError(f"{self} has not captured any frames yet.")
-
-        age_ms = (time.perf_counter() - timestamp) * 1e3
-        if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
-            )
+            raise RuntimeError(f"Event set but no frame available for {self}.")
 
         return frame
 
     def disconnect(self) -> None:
-        """
-        Disconnects from the camera, stops the pipeline, and cleans up resources.
-
-        Stops the background read thread (if running) and stops the RealSense pipeline.
-
-        Raises:
-            DeviceNotConnectedError: If the camera is already disconnected (pipeline not running).
-        """
-
-        if not self.is_connected and self.thread is None:
-            raise DeviceNotConnectedError(
-                f"Attempted to disconnect {self}, but it appears already disconnected."
-            )
+        if not self.connected and self.thread is None:
+            raise DeviceNotConnectedError(f"{self} already disconnected.")
 
         if self.thread is not None:
             self._stop_read_thread()
 
-        if self.rs_pipeline is not None:
-            self.rs_pipeline.stop()
-            self.rs_pipeline = None
-            self.rs_profile = None
+        if self.manager is not None:
+            self.manager.disconnect_client(id(self))
 
-        with self.frame_lock:
-            self.latest_color_frame = None
-            self.latest_depth_frame = None
-            self.latest_timestamp = None
-            self.new_frame_event.clear()
+        self.connected = False
+        self.latest_frame = None
+        self.new_frame_event.clear()
+        self._last_pipeline_seq = -1
+        self.manager = None
 
-        logger.info(f"{self} disconnected.")
+    def _require_snapshot(self) -> _FrameSnapshot | None:
+        if not self.connected or self.manager is None:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        self._sync_stream_settings()
+        return self.manager.get_latest_snapshot()
+
+
+class SharedRealSenseColorCamera(SharedRealSenseBaseCamera):
+    KIND = "color"
+
+    def __init__(self, config: RealSenseD405ColorCameraConfig | RealSenseD435iColorCameraConfig):
+        super().__init__(config)
+        self.color_mode = config.color_mode
+
+    def read(self, color_mode: ColorMode | None = None) -> NDArray[Any] | None:
+        snapshot = self._require_snapshot()
+        if snapshot is None:
+            return None
+        return self._read_from_snapshot(snapshot, color_mode=color_mode)
+
+    def _read_from_snapshot(
+        self, snapshot: _FrameSnapshot, color_mode: ColorMode | None = None
+    ) -> NDArray[Any] | None:
+        self._sync_stream_settings()
+        if snapshot.color is None:
+            return None
+        return self._postprocess_color_image(snapshot.color, color_mode=color_mode)
+
+    def _postprocess_color_image(
+        self, image_rgb: NDArray[Any], color_mode: ColorMode | None = None
+    ) -> NDArray[Any]:
+        if color_mode and color_mode not in (ColorMode.RGB, ColorMode.BGR):
+            raise ValueError(
+                f"Invalid requested color mode '{color_mode}'. Expected {ColorMode.RGB} or {ColorMode.BGR}."
+            )
+
+        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+            raise RuntimeError(f"{self} frame is expected to be HxWx3, but got shape={image_rgb.shape}.")
+
+        height, width, _ = image_rgb.shape
+        if height != self.capture_height or width != self.capture_width:
+            raise RuntimeError(
+                f"{self} frame width={width} or height={height} do not match configured width="
+                f"{self.capture_width} or height={self.capture_height}."
+            )
+
+        requested_color_mode = color_mode or self.color_mode
+        processed_image = image_rgb
+        if requested_color_mode == ColorMode.BGR:
+            processed_image = cv2.cvtColor(processed_image, cv2.COLOR_RGB2BGR)
+
+        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
+            processed_image = cv2.rotate(processed_image, self.rotation)
+
+        return processed_image
+
+
+class SharedRealSenseDepthCamera(SharedRealSenseBaseCamera):
+    KIND = "depth"
+
+    def __init__(self, config: RealSenseD405DepthCameraConfig | RealSenseD435iDepthCameraConfig):
+        super().__init__(config)
+        self.max_depth_m = (
+            float(config.max_depth_m)
+            if self.MODEL_TRAITS.supports_max_depth_m and hasattr(config, "max_depth_m")
+            else None
+        )
+        self.depth_alpha = float(getattr(config, "depth_alpha", 0.03))
+
+    def read(self, color_mode: ColorMode | None = None) -> NDArray[Any] | None:
+        del color_mode
+        snapshot = self._require_snapshot()
+        if snapshot is None:
+            return None
+        return self._read_from_snapshot(snapshot)
+
+    def _read_from_snapshot(self, snapshot: _FrameSnapshot, color_mode: ColorMode | None = None) -> NDArray[Any] | None:
+        del color_mode
+        self._sync_stream_settings()
+        if snapshot.depth is None:
+            return None
+        return self._postprocess_depth_image(snapshot.depth)
+
+    def _postprocess_depth_image(self, depth_map: NDArray[Any]) -> NDArray[Any]:
+        if depth_map.ndim != 2:
+            raise RuntimeError(f"{self} depth frame is expected to be HxW, but got shape={depth_map.shape}.")
+
+        height, width = depth_map.shape
+        if height != self.capture_height or width != self.capture_width:
+            raise RuntimeError(
+                f"{self} depth frame width={width} or height={height} do not match configured width="
+                f"{self.capture_width} or height={self.capture_height}."
+            )
+
+        depth_u16 = depth_map.astype(np.uint16, copy=False)
+        valid_mask = depth_u16 > 0
+        if self.max_depth_m is not None:
+            depth_scale = self.manager.depth_scale if self.manager is not None else 0.001
+            max_depth_raw = int(self.max_depth_m / depth_scale)
+            valid_mask &= depth_u16 <= max_depth_raw
+
+        depth_8u = cv2.convertScaleAbs(depth_u16, alpha=self.depth_alpha)
+        depth_rgb = cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+        depth_rgb[~valid_mask] = 0
+
+        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
+            depth_rgb = cv2.rotate(depth_rgb, self.rotation)
+
+        return depth_rgb
+
+
+class RealSenseD405ColorCamera(SharedRealSenseColorCamera):
+    MODEL_TRAITS = D405_MODEL_TRAITS
+
+
+class RealSenseD405DepthCamera(SharedRealSenseDepthCamera):
+    MODEL_TRAITS = D405_MODEL_TRAITS
+
+
+class RealSenseD435iColorCamera(SharedRealSenseColorCamera):
+    MODEL_TRAITS = D435I_MODEL_TRAITS
+
+
+class RealSenseD435iDepthCamera(SharedRealSenseDepthCamera):
+    MODEL_TRAITS = D435I_MODEL_TRAITS
+
+
+# Compatibility aliases for local tools that still import the old manager names.
+RealSenseD405Manager = SharedRealSenseManager
+RealSenseD435iManager = SharedRealSenseManager

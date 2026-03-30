@@ -1,82 +1,119 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from dataclasses import dataclass
 
 from ..configs import CameraConfig, ColorMode, Cv2Rotation
 
+_SUPPORTED_COLOR_STREAM_FORMATS = {
+    "rgb8": "rgb8",
+    "rs2_format_rgb8": "rgb8",
+    "bgr8": "bgr8",
+    "rs2_format_bgr8": "bgr8",
+    "yuyv": "yuyv",
+    "rs2_format_yuyv": "yuyv",
+}
 
-@CameraConfig.register_subclass("intelrealsense")
+
+def _validate_rotation(rotation: Cv2Rotation) -> None:
+    if rotation not in (
+        Cv2Rotation.NO_ROTATION,
+        Cv2Rotation.ROTATE_90,
+        Cv2Rotation.ROTATE_180,
+        Cv2Rotation.ROTATE_270,
+    ):
+        raise ValueError(
+            f"`rotation` is expected to be in "
+            f"{(Cv2Rotation.NO_ROTATION, Cv2Rotation.ROTATE_90, Cv2Rotation.ROTATE_180, Cv2Rotation.ROTATE_270)}, "
+            f"but {rotation} is provided."
+        )
+
+
+def _validate_stream_shape(fps: int | None, width: int | None, height: int | None) -> None:
+    values = (fps, width, height)
+    if any(v is not None for v in values) and any(v is None for v in values):
+        raise ValueError("For `fps`, `width` and `height`, either all of them need to be set, or none of them.")
+
+
+def _normalize_color_stream_format(color_stream_format: str) -> str:
+    normalized = color_stream_format.strip().lower()
+    if normalized not in _SUPPORTED_COLOR_STREAM_FORMATS:
+        raise ValueError(
+            f"`color_stream_format` is expected to be one of "
+            f"{tuple(sorted(_SUPPORTED_COLOR_STREAM_FORMATS))}, but {color_stream_format} is provided."
+        )
+    return _SUPPORTED_COLOR_STREAM_FORMATS[normalized]
+
+
+def _validate_positive_float(name: str, value: float) -> None:
+    if value <= 0:
+        raise ValueError(f"`{name}` is expected to be > 0, but {value} is provided.")
+
+
+@CameraConfig.register_subclass("realsense_d405_color")
 @dataclass
-class RealSenseCameraConfig(CameraConfig):
-    """Configuration class for Intel RealSense cameras.
-
-    This class provides specialized configuration options for Intel RealSense cameras,
-    including support for depth sensing and device identification via serial number or name.
-
-    Example configurations for Intel RealSense D405:
-    ```python
-    # Basic configurations
-    RealSenseCameraConfig("0123456789", 30, 1280, 720)  # 1280x720 @ 30FPS
-    RealSenseCameraConfig("0123456789", 60, 640, 480)  # 640x480 @ 60FPS
-
-    # Advanced configurations
-    RealSenseCameraConfig("0123456789", 30, 640, 480, use_depth=True)  # With depth sensing
-    RealSenseCameraConfig("0123456789", 30, 640, 480, rotation=Cv2Rotation.ROTATE_90)  # With 90° rotation
-    ```
-
-    Attributes:
-        fps: Requested frames per second for the color stream.
-        width: Requested frame width in pixels for the color stream.
-        height: Requested frame height in pixels for the color stream.
-        serial_number_or_name: Unique serial number or human-readable name to identify the camera.
-        color_mode: Color mode for image output (RGB or BGR). Defaults to RGB.
-        use_depth: Whether to enable depth stream. Defaults to False.
-        rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
-        warmup_s: Time reading frames before returning from connect (in seconds)
-
-    Note:
-        - Either name or serial_number must be specified.
-        - Depth stream configuration (if enabled) will use the same FPS as the color stream.
-        - The actual resolution and FPS may be adjusted by the camera to the nearest supported mode.
-        - For `fps`, `width` and `height`, either all of them need to be set, or none of them.
-    """
-
+class RealSenseD405ColorCameraConfig(CameraConfig):
     serial_number_or_name: str
     color_mode: ColorMode = ColorMode.RGB
-    use_depth: bool = False
+    color_stream_format: str = "rgb8"
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
 
     def __post_init__(self) -> None:
         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
             raise ValueError(
-                f"`color_mode` is expected to be {ColorMode.RGB.value} or {ColorMode.BGR.value}, but {self.color_mode} is provided."
+                f"`color_mode` is expected to be {ColorMode.RGB.value} or {ColorMode.BGR.value}, "
+                f"but {self.color_mode} is provided."
             )
 
-        if self.rotation not in (
-            Cv2Rotation.NO_ROTATION,
-            Cv2Rotation.ROTATE_90,
-            Cv2Rotation.ROTATE_180,
-            Cv2Rotation.ROTATE_270,
-        ):
+        _validate_rotation(self.rotation)
+        _validate_stream_shape(self.fps, self.width, self.height)
+        self.color_stream_format = _normalize_color_stream_format(self.color_stream_format)
+
+
+@CameraConfig.register_subclass("realsense_d405_depth")
+@dataclass
+class RealSenseD405DepthCameraConfig(CameraConfig):
+    serial_number_or_name: str
+    depth_alpha: float = 0.03
+    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
+    warmup_s: int = 5
+
+    def __post_init__(self) -> None:
+        _validate_rotation(self.rotation)
+        _validate_stream_shape(self.fps, self.width, self.height)
+        _validate_positive_float("depth_alpha", self.depth_alpha)
+
+
+@CameraConfig.register_subclass("realsense_d435i_color")
+@dataclass
+class RealSenseD435iColorCameraConfig(CameraConfig):
+    serial_number_or_name: str
+    color_mode: ColorMode = ColorMode.RGB
+    color_stream_format: str = "rgb8"
+    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
+    warmup_s: int = 1
+
+    def __post_init__(self) -> None:
+        if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
             raise ValueError(
-                f"`rotation` is expected to be in {(Cv2Rotation.NO_ROTATION, Cv2Rotation.ROTATE_90, Cv2Rotation.ROTATE_180, Cv2Rotation.ROTATE_270)}, but {self.rotation} is provided."
+                f"`color_mode` is expected to be {ColorMode.RGB.value} or {ColorMode.BGR.value}, "
+                f"but {self.color_mode} is provided."
             )
 
-        values = (self.fps, self.width, self.height)
-        if any(v is not None for v in values) and any(v is None for v in values):
-            raise ValueError(
-                "For `fps`, `width` and `height`, either all of them need to be set, or none of them."
-            )
+        _validate_rotation(self.rotation)
+        _validate_stream_shape(self.fps, self.width, self.height)
+        self.color_stream_format = _normalize_color_stream_format(self.color_stream_format)
+
+
+@CameraConfig.register_subclass("realsense_d435i_depth")
+@dataclass
+class RealSenseD435iDepthCameraConfig(CameraConfig):
+    serial_number_or_name: str
+    max_depth_m: float = 2.0
+    depth_alpha: float = 0.2
+    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
+    warmup_s: int = 5
+
+    def __post_init__(self) -> None:
+        _validate_rotation(self.rotation)
+        _validate_stream_shape(self.fps, self.width, self.height)
+        _validate_positive_float("max_depth_m", self.max_depth_m)
+        _validate_positive_float("depth_alpha", self.depth_alpha)
