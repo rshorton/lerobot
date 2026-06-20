@@ -2,15 +2,37 @@
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>
 
-<div align="center">
+## Fork of Seeed Fork for Elsabot robot using Jetson AGX Orin
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+WIP - Arms and cameras setup at this point.
+
+### Build docker
+
+```
+docker build  -f docker/Dockerfile.internal -t lerobot-internal_seeed .
+```
+
+### Run Docker
+
+```
+docker run -it --privileged --rm --gpus all -v ~/lerobot_config_files/:/home/user_lerobot/.cache/huggingface/  -v /dev/elsabot_dev_links:/dev/elsabot_dev_links -v /dev:/dev   -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v $HOME/.Xauthority:$HOME/.Xauthority -e XAUTHORITY=$HOME/.Xauthority  --shm-size 16gb lerobot-internal_seeed
+```
+
+### Teleoperate with 2 cameras
+
+```
+lerobot-teleoperate  \
+--robot.type=so101_follower \
+--robot.port=/dev/elsabot_dev_links/so101_follower \
+--robot.id=my_follower_arm \
+--teleop.type=so101_leader \
+--teleop.port=/dev/elsabot_dev_links/so101_leader \
+--teleop.id=my_leader_arm \
+--robot.cameras="{ wrist: {type: opencv, index_or_path: /dev/video4, width: 640, height: 480, fps: 30, fourcc: "YUYV"}, side: {type: opencv, index_or_path: /dev/video6, width: 640, height: 480, fps: 30, fourcc: "YUYV"}}" \
+--display_data=true
+```
+
+
 
 </div>
 
