@@ -749,11 +749,13 @@ class SharedRealSenseManager:
         depth = None
 
         color_frame = frames.get_color_frame()
-        if color_frame is not None:
+        #if color_frame is not None:
+        if color_frame:
             color = np.ascontiguousarray(_decode_color_frame_to_rgb(color_frame))
 
         depth_frame = frames.get_depth_frame()
-        if depth_frame is not None:
+        #if depth_frame is not None:
+        if depth_frame:
             depth = np.ascontiguousarray(np.asanyarray(depth_frame.get_data()).copy())
 
         return _FrameSnapshot(color=color, depth=depth)
