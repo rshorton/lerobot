@@ -44,22 +44,24 @@ def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[s
         # TODO(Steven): Consider just using the make_device_from_device_class for all types
         if cfg.type == "opencv":
             from .opencv import OpenCVCamera
+            cameras[key] = OpenCVCamera(cfg)
+            continue
 
-            source_key = _resolve_opencv_copy_source(cfg)
-            if source_key is None:
-                cameras[key] = OpenCVCamera(cfg)
-                continue
+#            source_key = _resolve_opencv_copy_source(cfg)
+#            if source_key is None:
+#                cameras[key] = OpenCVCamera(cfg)
+#                continue
+#
+#            if source_key not in cameras:
+#                raise ValueError(
+#                    f"OpenCV camera {key} copies from {source_key}, but {source_key} has not been declared earlier."
+#                )
 
-            if source_key not in cameras:
-                raise ValueError(
-                    f"OpenCV camera {key} copies from {source_key}, but {source_key} has not been declared earlier."
-                )
+#            source_camera = cameras[source_key]
+#            if not isinstance(source_camera, OpenCVCamera):
+#                raise ValueError(f"OpenCV camera {key} copies from non-OpenCV camera {source_key}.")
 
-            source_camera = cameras[source_key]
-            if not isinstance(source_camera, OpenCVCamera):
-                raise ValueError(f"OpenCV camera {key} copies from non-OpenCV camera {source_key}.")
-
-            cameras[key] = OpenCVCamera(cfg, source_camera=source_camera, source_key=source_key)
+#            cameras[key] = OpenCVCamera(cfg, source_camera=source_camera, source_key=source_key)
 
         elif cfg.type in {
             "realsense_d435i_color",
