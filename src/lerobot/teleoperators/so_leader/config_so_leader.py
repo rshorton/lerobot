@@ -30,6 +30,8 @@ class SOLeaderConfig:
     # Whether to use degrees for angles
     use_degrees: bool = False
 
+    # Whether arm has wrist yaw joint
+    has_wrist_yaw: bool = False
 
 @TeleoperatorConfig.register_subclass("so101_leader")
 @TeleoperatorConfig.register_subclass("so100_leader")

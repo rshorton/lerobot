@@ -42,6 +42,8 @@ class SOFollowerConfig:
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
 
+    # Whether arm has wrist yaw joint
+    has_wrist_yaw: bool = False
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")
