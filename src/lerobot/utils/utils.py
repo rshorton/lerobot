@@ -202,9 +202,11 @@ def say(text: str, blocking: bool = False):
         cmd = ["say", text]
 
     elif system == "Linux":
-        cmd = ["spd-say", text]
-        if blocking:
-            cmd.append("--wait")
+        cmd = [ "/opt/lerobot/say_text.sh", text ]
+
+        #cmd = ["spd-say", text]
+        #if blocking:
+        #    cmd.append("--wait")
 
     elif system == "Windows":
         cmd = [
