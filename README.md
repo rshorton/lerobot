@@ -1,3 +1,118 @@
+## Fork of Seeed Fork for Elsabot robot using Jetson AGX Orin
+
+This fork supports using a wrist_yaw joint which gives the arm 6 DOF. I did that to make it easier to also control it with MoveIt.  See this page for the STL files:  https://makerworld.com/en/models/1913316-so101-arm-wrist-yaw-6dof#profileId-2088553
+
+
+### Build docker
+
+#### Prerequisite: Build Jetson container that includes support for Pytorch version used by Lerobot project.
+
+This is necessary so that inferencing is accelerated.  Otherwise arm control is extremely slow.
+
+See this related post:
+https://forums.developer.nvidia.com/t/install-pytorch-on-jetson-orin-nano/357445
+
+To build (assumes you already have the Nvidia jetson containers repo cloned): 
+
+```
+cd ~/path_to/jetson-containers
+./build.sh pytorch:2.7-builder torchvision:0.22.0-builder
+```
+
+I was building for Jetpack 6.2 support.
+
+#### Build Lerobot container
+
+```
+docker build  -f docker/Dockerfile.internal -t lerobot-internal_seeed .
+```
+
+### Run Docker
+
+```
+cd ~/lerobot; docker run -it --net=host --privileged --rm --gpus all -v ~/lerobot_config_files/:/home/user_lerobot/.cache/huggingface/  -v /dev/elsabot_dev_links:/dev/elsabot_dev_links -v .:/opt/lerobot --device-cgroup-rule "c 81:* rmw"  --device-cgroup-rule "c 189:* rmw"  -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v $HOME/.Xauthority:$HOME/.Xauthority -e XAUTHORITY=$HOME/.Xauthority  --shm-size 16gb -e WANDB_API_KEY=${WANDB_API_KEY} 
+lerobot-internal_seeed
+```
+
+### Teleoperate with 3 cameras
+
+This was done after calibrating both arms.
+
+Note the added option 'has_wrist_yaw' for both follower and leader.
+
+```
+lerobot-teleoperate  \
+--robot.type=so101_follower \
+--robot.port=/dev/elsabot_dev_links/so101_follower \
+--robot.has_wrist_yaw=True \
+--robot.id=my_follower_arm_6dof \
+--teleop.type=so101_leader \
+--teleop.port=/dev/elsabot_dev_links/so101_leader \
+--teleop.has_wrist_yaw=True \
+--teleop.id=my_leader_arm_6dof \
+--robot.cameras="{front: {type: opencv, index_or_path: /dev/video8, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, side: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+--display_data=true
+```
+
+Cameras:
+  * Front - mounted below robot base looking below arm
+  * wrist - mounted on robot wrist
+  * side - mounted above and to the side a bit to see overall workspace
+
+(The robot arm is mounted on the front of my Elsabot robot which puts it approximately 22cm from the floor.)
+
+### Record training episodes
+
+```
+export REPO_ID="063024/test1"; lerobot-record \
+--robot.type=so101_follower \
+--robot.port=/dev/elsabot_dev_links/so101_follower \
+--robot.has_wrist_yaw=True \
+--robot.id=my_follower_arm_6dof \
+--teleop.type=so101_leader \
+--teleop.port=/dev/elsabot_dev_links/so101_leader \
+--teleop.has_wrist_yaw=True \
+--teleop.id=my_leader_arm_6dof \
+--robot.cameras="{front: {type: opencv, index_or_path: /dev/video8, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, side: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+--display_data=true \
+--dataset.single_task="Grab the green block" \
+--dataset.push_to_hub=False \
+--dataset.repo_id=${REPO_ID} \
+--dataset.episode_time_s=60 \
+--dataset.reset_time_s=2 \
+--dataset.num_episodes=25
+```
+
+The above was used to capture episodes for two positions of a 1"x1"x2" green block.
+
+### Training
+
+I tried training on a local computer with an older Nvidia GPU but it took more than a day and produced poor results.  (The batch size was limited to 12.)
+
+I also tried using Google Colab with a Pro subscription.  That used an A100-high-memory instance.  That required 6.5 hours and cost 44.2 compute units ($4.42).  It required 27.3GB of GPU memory for a batch size of 64.  20000 total steps.  1.2M samples.
+
+### Evaluation
+
+```
+export REPO_ID="063026/eval_smolvla"; lerobot-record \
+--robot.type=so101_follower \
+--robot.port=/dev/elsabot_dev_links/so101_follower \
+--robot.has_wrist_yaw=True \
+--robot.id=my_follower_arm_6dof \
+--robot.cameras="{ front: {type: opencv, index_or_path: /dev/video8, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, side: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+--display_data=true \
+--dataset.single_task="Grab the green block" \
+--dataset.repo_id=${REPO_ID} \
+--dataset.episode_time_s=500 \
+--dataset.num_episodes=10 \
+--policy.path=/home/user_lerobot/.cache/huggingface/lerobot/colab_063026/014000/pretrained_model \
+--policy.n_action_steps=25
+```
+
+Also tried action_steps of various sizes.
+
+Poor results.  I assume more training episodes are needed?
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>
