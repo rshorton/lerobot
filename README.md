@@ -89,7 +89,7 @@ The above was used to capture episodes for two positions of a 1"x1"x2" green blo
 
 I tried training on a local computer with an older Nvidia GPU but it took more than a day and produced poor results.  (The batch size was limited to 12.)
 
-I also tried using Google Colab with a Pro subscription.  That used an A100-high-memory instance.  That required 6.5 hours and cost 44.2 compute units ($4.42).  It required 27.3GB of GPU memory for a batch size of 64.  20000 total steps.  1.2M samples.
+I also tried using Google Colab with a Pro subscription.  That used an A100-high-memory instance.  That required 6.5 hours and cost 44.2 compute units ($4.42).  It required 27.3GB of GPU memory for a batch size of 64.  20000 total steps.  1.2M samples.  I saved the notebook file I used in the notebooks directory of this repo.
 
 ### Evaluation
 
